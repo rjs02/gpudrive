@@ -96,7 +96,7 @@ class GPUDriveTorchEnv(GPUDriveGymEnv):
             env_config=self.config,
         )
 
-    def reset(self, mask):
+    def reset(self, mask=None):
         """Reset the worlds and return the initial observations."""
         self.sim.reset(list(range(self.num_worlds)))
         return self.get_obs(mask)
@@ -352,7 +352,7 @@ class GPUDriveTorchEnv(GPUDriveGymEnv):
         )
         return action_space
 
-    def _get_ego_state(self, mask) -> torch.Tensor:
+    def _get_ego_state(self, mask=None) -> torch.Tensor:
         """Get the ego state."""
         
         if not self.config.ego_state:
@@ -366,22 +366,38 @@ class GPUDriveTorchEnv(GPUDriveGymEnv):
         if self.config.norm_obs:
             ego_state.normalize()
 
-        return (
-            torch.stack(
-                [
-                    ego_state.speed,
-                    ego_state.vehicle_length,
-                    ego_state.vehicle_width,
-                    ego_state.rel_goal_x,
-                    ego_state.rel_goal_y,
-                    ego_state.is_collided,
-                ]
+        if mask is None:
+            return (
+                torch.stack(
+                    [
+                        ego_state.speed,
+                        ego_state.vehicle_length,
+                        ego_state.vehicle_width,
+                        ego_state.rel_goal_x,
+                        ego_state.rel_goal_y,
+                        ego_state.is_collided,
+                    ]
+                )
+                .permute(1, 2, 0)
+                .to(self.device)
             )
-            .permute(1, 0)
-            .to(self.device)
-        )
+        else: 
+            return (
+                torch.stack(
+                    [
+                        ego_state.speed,
+                        ego_state.vehicle_length,
+                        ego_state.vehicle_width,
+                        ego_state.rel_goal_x,
+                        ego_state.rel_goal_y,
+                        ego_state.is_collided,
+                    ]
+                )
+                .permute(1, 0)
+                .to(self.device)
+            )
 
-    def _get_partner_obs(self, mask):
+    def _get_partner_obs(self, mask=None):
         """Get partner observations."""
         
         if not self.config.partner_obs:
@@ -395,9 +411,25 @@ class GPUDriveTorchEnv(GPUDriveGymEnv):
 
         if self.config.norm_obs:
             partner_obs.normalize()
-            # partner_obs.one_hot_encode_agent_types()
-
-        return partner_obs.data.flatten(start_dim=1)
+            
+        if mask is not None: 
+            return partner_obs.data.flatten(start_dim=1)
+        else:
+            return (
+                torch.concat(
+                    [
+                        partner_obs.speed,
+                        partner_obs.rel_pos_x,
+                        partner_obs.rel_pos_y,
+                        partner_obs.orientation,
+                        partner_obs.vehicle_length,
+                        partner_obs.vehicle_width,
+                    ],
+                    dim=-1,
+                )
+                .flatten(start_dim=2)
+                .to(self.device)
+            )
 
     def _get_road_map_obs(self, mask):
         """Get road map observations."""
@@ -414,15 +446,33 @@ class GPUDriveTorchEnv(GPUDriveGymEnv):
             roadgraph.normalize()
             roadgraph.one_hot_encode_road_point_types()
 
-        return torch.cat(
-            [
-                roadgraph.data,
-                roadgraph.type,
-            ],
-            dim=-1,
-        ).flatten(start_dim=1)
+        if mask is not None:
+            return torch.cat(
+                [
+                    roadgraph.data,
+                    roadgraph.type,
+                ],
+                dim=-1,
+            ).flatten(start_dim=1)
+        else:
+            return (
+                torch.cat(
+                    [
+                        roadgraph.x.unsqueeze(-1),
+                        roadgraph.y.unsqueeze(-1),
+                        roadgraph.segment_length.unsqueeze(-1),
+                        roadgraph.segment_width.unsqueeze(-1),
+                        roadgraph.segment_height.unsqueeze(-1),
+                        roadgraph.orientation.unsqueeze(-1),
+                        roadgraph.type,
+                    ],
+                    dim=-1,
+                )
+                .flatten(start_dim=2)
+                .to(self.device)
+            )
 
-    def _get_lidar_obs(self, mask):
+    def _get_lidar_obs(self, mask=None):
         """Get lidar observations."""
         
         if not self.config.lidar_obs:
@@ -433,13 +483,27 @@ class GPUDriveTorchEnv(GPUDriveGymEnv):
             backend=self.backend,
         )
 
-        return [
-            lidar.agent_samples[mask],
-            lidar.road_edge_samples[mask],
-            lidar.road_line_samples[mask],
-        ]
+        if mask is not None:
+            return [
+                lidar.agent_samples[mask],
+                lidar.road_edge_samples[mask],
+                lidar.road_line_samples[mask],
+            ]
+        else:
+            return (
+                torch.cat(
+                    [
+                        lidar.agent_samples,
+                        lidar.road_edge_samples,
+                        lidar.road_line_samples,
+                    ],
+                    dim=-1,
+                )
+                .flatten(start_dim=2)
+                .to(self.device)
+            )
 
-    def get_obs(self, mask):
+    def get_obs(self, mask=None):
         """Get observation: Combine different types of environment information into a single tensor.
 
         Returns:
@@ -633,11 +697,47 @@ class GPUDriveTorchEnv(GPUDriveGymEnv):
 
 if __name__ == "__main__":
     env_config = EnvConfig(dynamics_model="delta_local")
-    render_config = RenderConfig()
+    render_config = RenderConfig(render_3d=True)
+    
+    # Load policy
+    #examples/experimental/eval/eval_utils.py
+    from gpudrive.networks.late_fusion import NeuralNet
+    def load_policy(path_to_cpt, model_name, device, env=None):
+        """Load a policy from a given path."""
+
+        # Load the saved checkpoint
+        if model_name == "random_baseline":
+            return RandomPolicy(env.action_space.n)
+
+        else:  # Load a trained model
+            saved_cpt = torch.load(
+                f=f"{path_to_cpt}/{model_name}.pt",
+                map_location=device,
+                weights_only=False,
+            )            
+
+            # Create policy architecture from saved checkpoint
+            policy = NeuralNet(
+                input_dim=saved_cpt["model_arch"]["input_dim"],
+                action_dim=saved_cpt["action_dim"],
+                hidden_dim=saved_cpt["model_arch"]["hidden_dim"],
+            ).to(device)
+
+
+            # Load the model parameters
+            policy.load_state_dict(saved_cpt["parameters"])
+
+            return policy.eval()
+    
+    policy = load_policy(
+        path_to_cpt="examples/experimental/eval/models",
+        model_name="model_PPO__C__R_10000__01_28_20_57_35_873_011426",
+        device="cuda",
+    )
 
     # Create data loader
     train_loader = SceneDataLoader(
-        root="data/processed/training",
+        root="/scratch/kj2676/gpudrive/data/processed/training",
         batch_size=2,
         dataset_size=100,
         sample_with_replacement=True,
@@ -648,14 +748,15 @@ if __name__ == "__main__":
     env = GPUDriveTorchEnv(
         config=env_config,
         data_loader=train_loader,
-        max_cont_agents=128,  # Number of agents to control
+        max_cont_agents=64,  # Number of agents to control
         device="cuda",
     )
     
-    control_mask = env.cont_agent_mask
 
     # Rollout
-    obs = env.reset(control_mask)
+    obs = env.reset()
+    
+    control_mask = env.cont_agent_mask
 
     sim_frames = []
     agent_obs_frames = []
@@ -664,12 +765,25 @@ if __name__ == "__main__":
 
     env_idx = 0
 
-    for t in range(10):
+    for t in range(5):
         print(f"Step: {t}")
 
         # Step the environment
         expert_actions, _, _, _ = env.get_expert_actions()
         env.step_dynamics(expert_actions[:, :, t, :])
+        
+        action, _, _, _ = policy(
+            obs[control_mask], deterministic=True
+        )
+
+        # Insert actions into a template
+        action_template = torch.zeros(
+            (2, 64), dtype=torch.int64, device='cuda'
+        )
+        action_template[control_mask] = action.to('cuda')
+
+        # Step the environment
+        #env.step_dynamics(action_template)
         
         highlight_agent = torch.where(env.cont_agent_mask[env_idx, :])[0][
             -1
@@ -680,7 +794,7 @@ if __name__ == "__main__":
             env_indices=[env_idx],
             zoom_radius=50,
             time_steps=[t],
-            center_agent_indices=[highlight_agent],
+            #center_agent_indices=[highlight_agent],
         )
 
         agent_obs = env.vis.plot_agent_observation(
@@ -692,7 +806,7 @@ if __name__ == "__main__":
         sim_frames.append(img_from_fig(sim_states[0]))
         agent_obs_frames.append(img_from_fig(agent_obs))
 
-        obs = env.get_obs(control_mask)
+        obs = env.get_obs()
         reward = env.get_rewards()
         done = env.get_dones()
         info = env.get_infos()
